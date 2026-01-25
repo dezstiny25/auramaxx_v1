@@ -1,0 +1,161 @@
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
+#include <ArduinoJson.h>
+
+// ================== BLE UUIDs ==================
+#define SERVICE_UUID        "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
+#define CHARACTERISTIC_UUID "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
+
+// ================== RELAY PINS ==================
+#define FL_PIN 16
+#define FR_PIN 17
+#define RL_PIN 18
+#define RR_PIN 19
+
+// ================== GLOBALS ==================
+BLECharacteristic *pCharacteristic;
+
+String currentMode = "Solid"; // Modes: "Solid", "Strobe", "Chase", "Off"
+int strobeSpeed = 500;        // Milliseconds
+
+bool zoneFL = false;
+bool zoneFR = false;
+bool zoneRL = false;
+bool zoneRR = false;
+
+unsigned long previousMillis = 0;
+bool strobeState = false;
+int chaseIndex = 0;
+
+// ================== HELPER FUNCTIONS ==================
+// Low-level trigger relays: LOW = ON, HIGH = OFF
+void setRelay(int pin, bool on) {
+  digitalWrite(pin, on ? LOW : HIGH);
+}
+
+void allOff() {
+  setRelay(FL_PIN, false);
+  setRelay(FR_PIN, false);
+  setRelay(RL_PIN, false);
+  setRelay(RR_PIN, false);
+}
+
+void applyZones(bool state) {
+  setRelay(FL_PIN, zoneFL && state);
+  setRelay(FR_PIN, zoneFR && state);
+  setRelay(RL_PIN, zoneRL && state);
+  setRelay(RR_PIN, zoneRR && state);
+}
+
+// ================== BLE CALLBACK ==================
+class MyCallbacks : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic *pCharacteristic) override {
+    String payload = pCharacteristic->getValue().c_str();
+    Serial.println("📩 Received:");
+    Serial.println(payload);
+
+    StaticJsonDocument<256> doc;
+    DeserializationError error = deserializeJson(doc, payload);
+    if (error) {
+      Serial.println("❌ JSON parse failed");
+      return;
+    }
+
+    // Reset zones
+    zoneFL = zoneFR = zoneRL = zoneRR = false;
+
+    // Parse zones
+    for (JsonVariant zone : doc["zones"].as<JsonArray>()) {
+      String z = zone.as<String>();
+      if (z == "front_left")  zoneFL = true;
+      if (z == "front_right") zoneFR = true;
+      if (z == "rear_left")   zoneRL = true;
+      if (z == "rear_right")  zoneRR = true;
+    }
+
+    // Parse mode and speed
+    currentMode = doc["mode"].as<String>();
+    strobeSpeed = doc["speed"] | 500;
+
+    Serial.print("Mode: ");
+    Serial.println(currentMode);
+
+    // Immediately handle "Off" mode
+    if (currentMode == "Off") {
+      allOff();
+    }
+  }
+};
+
+// ================== SETUP ==================
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  pinMode(FL_PIN, OUTPUT);
+  pinMode(FR_PIN, OUTPUT);
+  pinMode(RL_PIN, OUTPUT);
+  pinMode(RR_PIN, OUTPUT);
+
+  allOff();
+
+  BLEDevice::init("AuraMaxx");
+  BLEServer *pServer = BLEDevice::createServer();
+  BLEService *pService = pServer->createService(SERVICE_UUID);
+
+  pCharacteristic = pService->createCharacteristic(
+    CHARACTERISTIC_UUID,
+    BLECharacteristic::PROPERTY_WRITE
+  );
+
+  pCharacteristic->setCallbacks(new MyCallbacks());
+  pCharacteristic->addDescriptor(new BLE2902());
+
+  pService->start();
+
+  BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
+  pAdvertising->addServiceUUID(SERVICE_UUID);
+  pAdvertising->start();
+
+  Serial.println("🚀 AuraMaxx BLE Ready");
+}
+
+// ================== LOOP ==================
+void loop() {
+  unsigned long now = millis();
+
+  if (currentMode == "Off") {
+    // Ensure all relays stay off
+    allOff();
+  }
+
+  else if (currentMode == "Solid") {
+    applyZones(true);
+  }
+
+  else if (currentMode == "Strobe") {
+    if (now - previousMillis >= strobeSpeed) {
+      previousMillis = now;
+      strobeState = !strobeState;
+      applyZones(strobeState);
+    }
+  }
+
+  else if (currentMode == "Chase") {
+    if (now - previousMillis >= strobeSpeed) {
+      previousMillis = now;
+      allOff();
+
+      switch (chaseIndex) {
+        case 0: if (zoneFL) setRelay(FL_PIN, true); break;
+        case 1: if (zoneFR) setRelay(FR_PIN, true); break;
+        case 2: if (zoneRL) setRelay(RL_PIN, true); break;
+        case 3: if (zoneRR) setRelay(RR_PIN, true); break;
+      }
+
+      chaseIndex = (chaseIndex + 1) % 4;
+    }
+  }
+}
