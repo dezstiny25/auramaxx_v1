@@ -6,93 +6,97 @@
 
 // ================== BLE UUIDs ==================
 #define SERVICE_UUID        "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
-#define CHARACTERISTIC_UUID "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
+#define RX_UUID             "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
+#define TX_UUID             "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"
 
-// ================== RELAY PINS ==================
+// ================== RELAY PINS (ACTIVE LOW) ==================
 #define FL_PIN 16
 #define FR_PIN 17
 #define RL_PIN 18
 #define RR_PIN 19
 
 // ================== GLOBALS ==================
-BLECharacteristic *pCharacteristic;
+BLECharacteristic *rxChar;
+BLECharacteristic *txChar;
 
-String currentMode = "Solid"; // Modes: "Solid", "Strobe", "Chase", "Off"
-int strobeSpeed = 500;        // Milliseconds
+String currentMode = "Off";
+int offDelayMs = 500;
 
 bool zoneFL = false;
 bool zoneFR = false;
 bool zoneRL = false;
 bool zoneRR = false;
 
-unsigned long previousMillis = 0;
-bool strobeState = false;
+unsigned long lastTick = 0;
+bool pulseOn = false;
 int chaseIndex = 0;
 
-// ================== HELPER FUNCTIONS ==================
-// Low-level trigger relays: LOW = ON, HIGH = OFF
-void setRelay(int pin, bool on) {
-  digitalWrite(pin, on ? LOW : HIGH);
+// ================== HELPERS ==================
+void relayWrite(int pin, bool on) {
+  digitalWrite(pin, on ? LOW : HIGH); // ACTIVE LOW
 }
 
 void allOff() {
-  setRelay(FL_PIN, false);
-  setRelay(FR_PIN, false);
-  setRelay(RL_PIN, false);
-  setRelay(RR_PIN, false);
+  relayWrite(FL_PIN, false);
+  relayWrite(FR_PIN, false);
+  relayWrite(RL_PIN, false);
+  relayWrite(RR_PIN, false);
 }
 
-void applyZones(bool state) {
-  setRelay(FL_PIN, zoneFL && state);
-  setRelay(FR_PIN, zoneFR && state);
-  setRelay(RL_PIN, zoneRL && state);
-  setRelay(RR_PIN, zoneRR && state);
+void applyZones(bool on) {
+  relayWrite(FL_PIN, zoneFL && on);
+  relayWrite(FR_PIN, zoneFR && on);
+  relayWrite(RL_PIN, zoneRL && on);
+  relayWrite(RR_PIN, zoneRR && on);
+}
+
+void notifyState() {
+  StaticJsonDocument<128> doc;
+  doc["mode"] = currentMode;
+  JsonArray z = doc.createNestedArray("zones");
+  if (zoneFL) z.add("front_left");
+  if (zoneFR) z.add("front_right");
+  if (zoneRL) z.add("rear_left");
+  if (zoneRR) z.add("rear_right");
+
+  String out;
+  serializeJson(doc, out);
+  txChar->setValue(out.c_str());
+  txChar->notify();
 }
 
 // ================== BLE CALLBACK ==================
-class MyCallbacks : public BLECharacteristicCallbacks {
-  void onWrite(BLECharacteristic *pCharacteristic) override {
-    String payload = pCharacteristic->getValue().c_str();
-    Serial.println("📩 Received:");
-    Serial.println(payload);
+class RXCallbacks : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic *c) override {
+    String payload = c->getValue().c_str();
 
     StaticJsonDocument<256> doc;
-    DeserializationError error = deserializeJson(doc, payload);
-    if (error) {
-      Serial.println("❌ JSON parse failed");
-      return;
-    }
+    if (deserializeJson(doc, payload)) return;
 
-    // Reset zones
     zoneFL = zoneFR = zoneRL = zoneRR = false;
 
-    // Parse zones
-    for (JsonVariant zone : doc["zones"].as<JsonArray>()) {
-      String z = zone.as<String>();
-      if (z == "front_left")  zoneFL = true;
-      if (z == "front_right") zoneFR = true;
-      if (z == "rear_left")   zoneRL = true;
-      if (z == "rear_right")  zoneRR = true;
+    for (JsonVariant z : doc["zones"].as<JsonArray>()) {
+      String s = z.as<String>();
+      if (s == "front_left") zoneFL = true;
+      if (s == "front_right") zoneFR = true;
+      if (s == "rear_left") zoneRL = true;
+      if (s == "rear_right") zoneRR = true;
     }
 
-    // Parse mode and speed
     currentMode = doc["mode"].as<String>();
-    strobeSpeed = doc["speed"] | 500;
+    offDelayMs = doc["speed"] | 500;
 
-    Serial.print("Mode: ");
-    Serial.println(currentMode);
-
-    // Immediately handle "Off" mode
     if (currentMode == "Off") {
       allOff();
     }
+
+    notifyState();
   }
 };
 
 // ================== SETUP ==================
 void setup() {
   Serial.begin(115200);
-  delay(1000);
 
   pinMode(FL_PIN, OUTPUT);
   pinMode(FR_PIN, OUTPUT);
@@ -101,61 +105,65 @@ void setup() {
 
   allOff();
 
+  // Startup animation
+  relayWrite(FL_PIN, true); delay(120);
+  relayWrite(FR_PIN, true); delay(120);
+  relayWrite(RL_PIN, true); delay(120);
+  relayWrite(RR_PIN, true); delay(120);
+  allOff();
+
   BLEDevice::init("AuraMaxx");
-  BLEServer *pServer = BLEDevice::createServer();
-  BLEService *pService = pServer->createService(SERVICE_UUID);
+  BLEServer *server = BLEDevice::createServer();
+  BLEService *service = server->createService(SERVICE_UUID);
 
-  pCharacteristic = pService->createCharacteristic(
-    CHARACTERISTIC_UUID,
-    BLECharacteristic::PROPERTY_WRITE
-  );
+  rxChar = service->createCharacteristic(RX_UUID, BLECharacteristic::PROPERTY_WRITE);
+  txChar = service->createCharacteristic(TX_UUID, BLECharacteristic::PROPERTY_NOTIFY);
 
-  pCharacteristic->setCallbacks(new MyCallbacks());
-  pCharacteristic->addDescriptor(new BLE2902());
+  rxChar->setCallbacks(new RXCallbacks());
+  txChar->addDescriptor(new BLE2902());
 
-  pService->start();
-
-  BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
-  pAdvertising->addServiceUUID(SERVICE_UUID);
-  pAdvertising->start();
-
-  Serial.println("🚀 AuraMaxx BLE Ready");
+  service->start();
+  BLEDevice::getAdvertising()->addServiceUUID(SERVICE_UUID);
+  BLEDevice::getAdvertising()->start();
 }
 
 // ================== LOOP ==================
 void loop() {
   unsigned long now = millis();
 
-  if (currentMode == "Off") {
-    // Ensure all relays stay off
+  if (currentMode == "Solid") {
+    applyZones(true);
+    return;
+  }
+
+  if (now - lastTick < offDelayMs) return;
+  lastTick = now;
+
+  // Short ON pulse
+  if (currentMode == "Strobe") {
+    applyZones(true);
+    delay(50);
     allOff();
   }
 
-  else if (currentMode == "Solid") {
-    applyZones(true);
-  }
-
-  else if (currentMode == "Strobe") {
-    if (now - previousMillis >= strobeSpeed) {
-      previousMillis = now;
-      strobeState = !strobeState;
-      applyZones(strobeState);
-    }
-  }
-
   else if (currentMode == "Chase") {
-    if (now - previousMillis >= strobeSpeed) {
-      previousMillis = now;
-      allOff();
+    allOff();
+    if (chaseIndex == 0 && zoneFL) relayWrite(FL_PIN, true);
+    if (chaseIndex == 1 && zoneFR) relayWrite(FR_PIN, true);
+    if (chaseIndex == 2 && zoneRL) relayWrite(RL_PIN, true);
+    if (chaseIndex == 3 && zoneRR) relayWrite(RR_PIN, true);
+    delay(50);
+    allOff();
+    chaseIndex = (chaseIndex + 1) % 4;
+  }
 
-      switch (chaseIndex) {
-        case 0: if (zoneFL) setRelay(FL_PIN, true); break;
-        case 1: if (zoneFR) setRelay(FR_PIN, true); break;
-        case 2: if (zoneRL) setRelay(RL_PIN, true); break;
-        case 3: if (zoneRR) setRelay(RR_PIN, true); break;
-      }
-
-      chaseIndex = (chaseIndex + 1) % 4;
-    }
+  else if (currentMode == "Random") {
+    allOff();
+    if (random(0, 2)) relayWrite(FL_PIN, true);
+    if (random(0, 2)) relayWrite(FR_PIN, true);
+    if (random(0, 2)) relayWrite(RL_PIN, true);
+    if (random(0, 2)) relayWrite(RR_PIN, true);
+    delay(50);
+    allOff();
   }
 }

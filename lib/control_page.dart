@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:ui';
 
@@ -27,20 +28,27 @@ class _ControlPageState extends State<ControlPage>
   bool isConnected = false;
 
   final Set<LightZone> selectedZones = {};
-  String selectedMode = 'Strobe';
+  String selectedMode = 'Solid';
   double speed = 50;
 
   ActiveOverlay activeOverlay = ActiveOverlay.none;
-  final List<String> modes = ['Solid', 'Strobe', 'Chase'];
+
+  final List<String> modes = ['Solid', 'Strobe', 'Chase', 'Random'];
 
   List<Map<String, dynamic>> presets = [];
   static const String _presetsKey = 'auramaxx_presets_v1';
   int selectedPresetIndex = 0;
+  int selectedModeIndex = 0;
 
   late AnimationController overlayAnim;
   late Animation<double> overlayScale;
   late Animation<double> overlayFade;
 
+  Timer? _speedDebounce;
+
+  // =========================
+  // INIT
+  // =========================
   @override
   void initState() {
     super.initState();
@@ -60,26 +68,15 @@ class _ControlPageState extends State<ControlPage>
     });
 
     _loadPresets();
+    selectedModeIndex = modes.indexOf(selectedMode).clamp(0, modes.length - 1);
   }
 
-  Future<void> _loadPresets() async {
-    final sp = await SharedPreferences.getInstance();
-    final raw = sp.getString(_presetsKey);
-    if (raw == null) return;
-    try {
-      final List decoded = jsonDecode(raw);
-      presets = decoded.cast<Map<String, dynamic>>();
-      setState(() {});
-    } catch (_) {}
-  }
-
-  Future<void> _savePresetsToStorage() async {
-    final sp = await SharedPreferences.getInstance();
-    await sp.setString(_presetsKey, jsonEncode(presets));
-  }
-
+  // =========================
+  // OVERLAY TOGGLE (FIXED)
+  // =========================
   void _toggleOverlay(ActiveOverlay overlay) {
     HapticFeedback.lightImpact();
+
     setState(() {
       if (activeOverlay == overlay) {
         activeOverlay = ActiveOverlay.none;
@@ -91,6 +88,54 @@ class _ControlPageState extends State<ControlPage>
     });
   }
 
+  // =========================
+  // PRESETS
+  // =========================
+  Future<void> _loadPresets() async {
+    final sp = await SharedPreferences.getInstance();
+    final raw = sp.getString(_presetsKey);
+    if (raw == null) return;
+
+    try {
+      presets = (jsonDecode(raw) as List).cast<Map<String, dynamic>>();
+      setState(() {});
+    } catch (_) {}
+  }
+
+  Future<void> _savePresets() async {
+    final sp = await SharedPreferences.getInstance();
+    await sp.setString(_presetsKey, jsonEncode(presets));
+  }
+
+  Future<void> _applyPreset(Map<String, dynamic> preset) async {
+    // briefly turn everything off before applying
+    widget.ble.send(jsonEncode({
+      "zones": [],
+      "mode": "Off",
+      "speed": 0,
+    }));
+
+    await Future.delayed(const Duration(milliseconds: 50));
+
+    selectedZones.clear();
+    for (final z in preset['zones']) {
+      if (z == 'front_left') selectedZones.add(LightZone.frontLeft);
+      if (z == 'front_right') selectedZones.add(LightZone.frontRight);
+      if (z == 'rear_left') selectedZones.add(LightZone.rearLeft);
+      if (z == 'rear_right') selectedZones.add(LightZone.rearRight);
+    }
+
+    setState(() {
+      selectedMode = preset['mode'];
+      speed = (preset['speed']).toDouble();
+    });
+
+    _sendUpdate();
+  }
+
+  // =========================
+  // ZONES
+  // =========================
   void _toggleZone(LightZone zone) {
     HapticFeedback.selectionClick();
     setState(() {
@@ -101,14 +146,17 @@ class _ControlPageState extends State<ControlPage>
     _sendUpdate();
   }
 
+  // =========================
+  // POWER OFF
+  // =========================
   void _turnOffAll() {
     HapticFeedback.heavyImpact();
 
-    setState(() {
-      selectedZones.clear();
-      selectedMode = 'Off';
-      speed = 0;
-    });
+    selectedZones.clear();
+    selectedMode = 'Off';
+    speed = 0;
+
+    setState(() {});
 
     if (!isConnected) return;
 
@@ -119,117 +167,25 @@ class _ControlPageState extends State<ControlPage>
     }));
   }
 
+  // =========================
+  // SEND TO ESP32
+  // =========================
   void _sendUpdate() {
     if (!isConnected || selectedMode == 'Off') return;
 
-    // Convert speed to milliseconds for ESP32 firmware
-    final int delayMs = (1000 - (speed * 9)).clamp(100, 1000).toInt();
+    // Speed controls OFF delay (blink-only ON)
+    final int offDelayMs = (1000 - (speed * 9)).clamp(80, 1000).toInt();
 
     widget.ble.send(jsonEncode({
       "zones": selectedZones.map(zoneName).toList(),
       "mode": selectedMode,
-      "speed": delayMs,
+      "speed": offDelayMs,
     }));
   }
 
-  void _openBleScanPage() {
-    Navigator.push(
-      context,
-      MaterialPageRoute(builder: (_) => BleScanPage(ble: widget.ble)),
-    );
-  }
-
-  Future<void> _promptSavePreset() async {
-    final controller = TextEditingController();
-    final name = await showDialog<String?>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text('Save Preset'),
-        content: TextField(
-          controller: controller,
-          decoration: const InputDecoration(hintText: 'Preset name'),
-        ),
-        actions: [
-          TextButton(
-              onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
-          TextButton(
-              onPressed: () => Navigator.pop(ctx, controller.text.trim()),
-              child: const Text('Save')),
-        ],
-      ),
-    );
-
-    if (name == null || name.isEmpty) return;
-
-    final preset = {
-      'name': name,
-      'zones': selectedZones.map(zoneName).toList(),
-      'mode': selectedMode,
-      'speed': speed.toInt(),
-    };
-
-    setState(() {
-      presets.add(preset);
-      selectedPresetIndex = presets.length - 1;
-    });
-    await _savePresetsToStorage();
-  }
-
-  Future<void> _deletePresetWithConfirmation() async {
-    if (presets.isEmpty) return;
-
-    final confirm = await showDialog<bool>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text('Delete Preset'),
-        content: Text(
-            'Are you sure you want to delete preset "${presets[selectedPresetIndex]['name']}"?'),
-        actions: [
-          TextButton(
-              onPressed: () => Navigator.pop(ctx, false),
-              child: const Text('Cancel')),
-          TextButton(
-              onPressed: () => Navigator.pop(ctx, true),
-              child: const Text('Delete')),
-        ],
-      ),
-    );
-
-    if (confirm == true) {
-      setState(() {
-        presets.removeAt(selectedPresetIndex);
-        if (selectedPresetIndex >= presets.length) selectedPresetIndex = 0;
-      });
-      await _savePresetsToStorage();
-    }
-  }
-
-  Future<void> _applyPreset(Map<String, dynamic> preset) async {
-    final List zones = preset['zones'] ?? [];
-    selectedZones.clear();
-    for (final z in zones) {
-      switch (z) {
-        case 'front_left':
-          selectedZones.add(LightZone.frontLeft);
-          break;
-        case 'front_right':
-          selectedZones.add(LightZone.frontRight);
-          break;
-        case 'rear_left':
-          selectedZones.add(LightZone.rearLeft);
-          break;
-        case 'rear_right':
-          selectedZones.add(LightZone.rearRight);
-          break;
-      }
-    }
-    setState(() {
-      selectedMode = preset['mode'] ?? selectedMode;
-      speed = (preset['speed'] ?? speed).toDouble();
-    });
-    _sendUpdate();
-  }
-
+  // =========================
+  // UI
+  // =========================
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -248,15 +204,15 @@ class _ControlPageState extends State<ControlPage>
             },
           ),
           GestureDetector(
-            onTap: _openBleScanPage,
+            onTap: () => Navigator.push(
+              context,
+              MaterialPageRoute(builder: (_) => BleScanPage(ble: widget.ble)),
+            ),
             child: Padding(
               padding: const EdgeInsets.symmetric(horizontal: 16),
               child: Row(
                 children: [
-                  Text(
-                    isConnected ? 'Connected' : 'Disconnected',
-                    style: const TextStyle(fontSize: 14),
-                  ),
+                  Text(isConnected ? 'Connected' : 'Disconnected'),
                   const SizedBox(width: 6),
                   Container(
                     width: 10,
@@ -278,7 +234,7 @@ class _ControlPageState extends State<ControlPage>
             child: Image.asset('assets/bground.png', fit: BoxFit.cover),
           ),
 
-          // 🔥 OFF button at top-left below status bar
+          // POWER BUTTON
           Positioned(
             top: 12,
             left: 12,
@@ -293,16 +249,10 @@ class _ControlPageState extends State<ControlPage>
           Column(
             children: [
               Expanded(
-                flex: 2,
                 child: Stack(
                   alignment: Alignment.center,
                   children: [
-                    Image.asset(
-                      'assets/Car.png',
-                      width: 400,
-                      color: Colors.white70,
-                      colorBlendMode: BlendMode.modulate,
-                    ),
+                    Image.asset('assets/Car.png', width: 380),
                     Positioned(
                         top: 60,
                         left: 90,
@@ -325,53 +275,44 @@ class _ControlPageState extends State<ControlPage>
                   ],
                 ),
               ),
-              Expanded(
-                flex: 1,
-                child: Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 24),
-                  child: SingleChildScrollView(
-                    child: Column(
-                      mainAxisSize: MainAxisSize.min,
+              Padding(
+                padding: const EdgeInsets.fromLTRB(24, 12, 24, 64),
+                child: Column(
+                  children: [
+                    Row(
                       children: [
-                        Row(
-                          children: [
-                            Expanded(
-                              child: controlButton(
-                                icon: Icons.auto_awesome,
-                                label: 'MODE',
-                                value: selectedMode,
-                                onTap: () => _toggleOverlay(ActiveOverlay.mode),
-                              ),
-                            ),
-                            const SizedBox(width: 16),
-                            Expanded(
-                              child: controlButton(
-                                icon: Icons.speed,
-                                label: 'SPEED',
-                                value: '${speed.toInt()}%',
-                                onTap: () =>
-                                    _toggleOverlay(ActiveOverlay.speed),
-                              ),
-                            ),
-                          ],
+                        Expanded(
+                          child: controlButton(
+                            icon: Icons.auto_awesome,
+                            label: 'MODE',
+                            value: selectedMode,
+                            onTap: () => _toggleOverlay(ActiveOverlay.mode),
+                          ),
                         ),
-                        const SizedBox(height: 18),
-                        Row(
-                          children: [
-                            Expanded(
-                              child: controlButton(
-                                icon: Icons.bookmark,
-                                label: 'PRESETS',
-                                value: '${presets.length} Saved',
-                                onTap: () =>
-                                    _toggleOverlay(ActiveOverlay.presets),
-                              ),
-                            ),
-                          ],
+                        const SizedBox(width: 16),
+                        Expanded(
+                          child: controlButton(
+                            icon: Icons.speed,
+                            label: 'SPEED',
+                            value: '${speed.toInt()}%',
+                            onTap: () => _toggleOverlay(ActiveOverlay.speed),
+                          ),
                         ),
                       ],
                     ),
-                  ),
+                    const SizedBox(height: 16),
+
+                    // FULL WIDTH PRESET BUTTON
+                    SizedBox(
+                      width: double.infinity,
+                      child: controlButton(
+                        icon: Icons.bookmark,
+                        label: 'PRESETS',
+                        value: '${presets.length} Saved',
+                        onTap: () => _toggleOverlay(ActiveOverlay.presets),
+                      ),
+                    ),
+                  ],
                 ),
               ),
             ],
@@ -380,20 +321,20 @@ class _ControlPageState extends State<ControlPage>
           if (activeOverlay != ActiveOverlay.none)
             Positioned.fill(
               child: GestureDetector(
-                onTap: () => setState(() => activeOverlay = ActiveOverlay.none),
+                onTap: () {
+                  setState(() => activeOverlay = ActiveOverlay.none);
+                  overlayAnim.reverse();
+                },
                 child: BackdropFilter(
                   filter: ImageFilter.blur(sigmaX: 8, sigmaY: 8),
                   child: Container(
                     color: Colors.black45,
                     child: Center(
-                      child: GestureDetector(
-                        onTap: () {}, // absorb taps
-                        child: ScaleTransition(
-                          scale: overlayScale,
-                          child: FadeTransition(
-                            opacity: overlayFade,
-                            child: overlayCard(),
-                          ),
+                      child: ScaleTransition(
+                        scale: overlayScale,
+                        child: FadeTransition(
+                          opacity: overlayFade,
+                          child: overlayCard(),
                         ),
                       ),
                     ),
@@ -406,74 +347,263 @@ class _ControlPageState extends State<ControlPage>
     );
   }
 
+  // =========================
+  // OVERLAYS
+  // =========================
   Widget overlayCard() {
     Widget child;
-    double height = 200;
+    double height;
 
     switch (activeOverlay) {
       case ActiveOverlay.mode:
         child = modeOverlay();
         height = 260;
         break;
-      case ActiveOverlay.speed:
-        child = speedOverlay();
-        height = 200;
-        break;
       case ActiveOverlay.presets:
         child = presetsOverlay();
         height = 320;
         break;
+      case ActiveOverlay.speed:
+        child = speedOverlay();
+        height = 180;
+        break;
       default:
         child = const SizedBox();
+        height = 0;
     }
+
+    // reserve some safe space for status/nav bars and avoid doubling padding
+    final screenHeight = MediaQuery.of(context).size.height;
+    final safePadding = MediaQuery.of(context).padding.top +
+        MediaQuery.of(context).padding.bottom +
+        40.0;
+    final maxAllowed = (screenHeight - safePadding) * 0.85;
+    final containerHeight = (height.clamp(0.0, maxAllowed) as double);
 
     return Container(
       width: 320,
-      height: height,
+      height: containerHeight,
       padding: const EdgeInsets.all(20),
       decoration: BoxDecoration(
         color: Colors.black.withOpacity(0.75),
         borderRadius: BorderRadius.circular(20),
         border: Border.all(color: Colors.white12),
-        boxShadow: [
-          BoxShadow(
-            color: Colors.redAccent.withOpacity(0.6),
-            blurRadius: 22,
-          ),
-        ],
       ),
       child: child,
     );
   }
 
   Widget modeOverlay() {
-    final controller =
-        FixedExtentScrollController(initialItem: modes.indexOf(selectedMode));
+    final initial = selectedModeIndex.clamp(0, modes.length - 1);
     return CupertinoPicker(
-      scrollController: controller,
+      scrollController: FixedExtentScrollController(initialItem: initial),
       itemExtent: 40,
-      magnification: 1.15,
       useMagnifier: true,
-      onSelectedItemChanged: (index) {
-        setState(() => selectedMode = modes[index]);
+      magnification: 1.15,
+      onSelectedItemChanged: (i) {
+        setState(() {
+          selectedModeIndex = i;
+          selectedMode = modes[i];
+        });
         _sendUpdate();
       },
-      children: modes.map((m) {
-        final isSelected = m == selectedMode;
+      children: modes.asMap().entries.map((e) {
+        final idx = e.key;
+        final m = e.value;
+        final selected = idx == selectedModeIndex;
         return Center(
           child: Text(
-            m.toUpperCase(),
+            m,
             style: TextStyle(
-              fontSize: isSelected ? 24 : 18,
-              fontWeight: FontWeight.bold,
-              color: Colors.white,
-              shadows: isSelected
-                  ? [const Shadow(color: Colors.redAccent, blurRadius: 22)]
-                  : [],
+              color: selected ? Colors.white : Colors.white54,
+              fontSize: selected ? 20 : 16,
+              fontWeight: selected ? FontWeight.w600 : FontWeight.normal,
             ),
           ),
         );
       }).toList(),
+    );
+  }
+
+  Widget presetsOverlay() {
+    if (presets.isEmpty) {
+      return Column(
+        children: [
+          const Expanded(
+            child: Center(
+                child: Text('No saved presets',
+                    style: TextStyle(color: Colors.white))),
+          ),
+          SizedBox(
+            width: double.infinity,
+            child: ElevatedButton(
+              style: ElevatedButton.styleFrom(
+                backgroundColor: Colors.redAccent,
+              ),
+              onPressed: () async {
+                final controller = TextEditingController();
+                final name = await showDialog<String>(
+                  context: context,
+                  builder: (ctx) => AlertDialog(
+                    backgroundColor: Colors.black87,
+                    title: const Text('Preset name',
+                        style: TextStyle(color: Colors.white)),
+                    content: TextField(
+                      controller: controller,
+                      style: const TextStyle(color: Colors.white),
+                      decoration: const InputDecoration(
+                        hintText: 'Name',
+                        hintStyle: TextStyle(color: Colors.white38),
+                      ),
+                    ),
+                    actions: [
+                      TextButton(
+                        onPressed: () => Navigator.of(ctx).pop(null),
+                        child: const Text('Cancel'),
+                      ),
+                      TextButton(
+                        onPressed: () =>
+                            Navigator.of(ctx).pop(controller.text.trim()),
+                        child: const Text('Save'),
+                      ),
+                    ],
+                  ),
+                );
+                if (name == null) return;
+                setState(() {
+                  presets.add({
+                    'name':
+                        name.isEmpty ? 'Preset ${presets.length + 1}' : name,
+                    'zones': selectedZones.map(zoneName).toList(),
+                    'mode': selectedMode,
+                    'speed': speed.toInt(),
+                  });
+                  _savePresets();
+                  selectedPresetIndex = presets.length - 1;
+                });
+              },
+              child:
+                  const Text('Save New', style: TextStyle(color: Colors.white)),
+            ),
+          ),
+        ],
+      );
+    }
+
+    final initial = selectedPresetIndex.clamp(0, presets.length - 1);
+    return Column(
+      children: [
+        SizedBox(
+          height: 180,
+          child: CupertinoPicker(
+            scrollController: FixedExtentScrollController(initialItem: initial),
+            itemExtent: 40,
+            onSelectedItemChanged: (i) {
+              setState(() => selectedPresetIndex = i);
+              if (i >= 0 && i < presets.length) {
+                _applyPreset(presets[i]);
+                // keep overlay open (do not close)
+              }
+            },
+            children: presets.asMap().entries.map((e) {
+              final idx = e.key;
+              final p = e.value;
+              final label = p['name'] ?? p['mode'] ?? 'Preset ${idx + 1}';
+              final selected = idx == selectedPresetIndex;
+              return Center(
+                child: Text(
+                  label,
+                  style: TextStyle(
+                    color: selected ? Colors.white : Colors.white54,
+                    fontSize: selected ? 18 : 15,
+                    fontWeight: selected ? FontWeight.w600 : FontWeight.normal,
+                  ),
+                ),
+              );
+            }).toList(),
+          ),
+        ),
+        const SizedBox(height: 1),
+        Column(
+          children: [
+            SizedBox(
+              width: double.infinity,
+              child: OutlinedButton(
+                onPressed: presets.isEmpty
+                    ? null
+                    : () {
+                        setState(() {
+                          presets.removeAt(selectedPresetIndex);
+                          if (presets.isEmpty) {
+                            selectedPresetIndex = 0;
+                          } else if (selectedPresetIndex >= presets.length) {
+                            selectedPresetIndex = presets.length - 1;
+                          }
+                          _savePresets();
+                        });
+                      },
+                style: OutlinedButton.styleFrom(
+                    side: const BorderSide(color: Colors.white24)),
+                child:
+                    const Text('Delete', style: TextStyle(color: Colors.white)),
+              ),
+            ),
+            const SizedBox(height: 1),
+            SizedBox(
+              width: double.infinity,
+              child: ElevatedButton(
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: Colors.redAccent,
+                ),
+                onPressed: () async {
+                  final controller = TextEditingController();
+                  final name = await showDialog<String>(
+                    context: context,
+                    builder: (ctx) => AlertDialog(
+                      backgroundColor: Colors.black87,
+                      title: const Text('Preset name',
+                          style: TextStyle(color: Colors.white)),
+                      content: TextField(
+                        controller: controller,
+                        style: const TextStyle(color: Colors.white),
+                        decoration: const InputDecoration(
+                          hintText: 'Name',
+                          hintStyle: TextStyle(color: Colors.white38),
+                        ),
+                      ),
+                      actions: [
+                        TextButton(
+                          onPressed: () => Navigator.of(ctx).pop(null),
+                          child: const Text('Cancel'),
+                        ),
+                        TextButton(
+                          onPressed: () =>
+                              Navigator.of(ctx).pop(controller.text.trim()),
+                          child: const Text('Save'),
+                        ),
+                      ],
+                    ),
+                  );
+                  if (name == null) return;
+                  setState(() {
+                    presets.add({
+                      'name':
+                          name.isEmpty ? 'Preset ${presets.length + 1}' : name,
+                      'zones': selectedZones.map(zoneName).toList(),
+                      'mode': selectedMode,
+                      'speed': speed.toInt(),
+                    });
+                    _savePresets();
+                    selectedPresetIndex = presets.length - 1;
+                  });
+                },
+                child: const Text('Save New',
+                    style: TextStyle(color: Colors.white)),
+              ),
+            ),
+          ],
+        ),
+      ],
     );
   }
 
@@ -486,173 +616,71 @@ class _ControlPageState extends State<ControlPage>
           value: speed,
           onChanged: (v) {
             setState(() => speed = v);
-            _sendUpdate();
+            _speedDebounce?.cancel();
+            _speedDebounce =
+                Timer(const Duration(milliseconds: 120), _sendUpdate);
           },
         ),
-        const SizedBox(height: 12),
-        Text(
-          '${speed.toInt()}%',
-          style: const TextStyle(
-            fontSize: 22,
-            color: Colors.white,
-            shadows: [
-              Shadow(color: Colors.redAccent, blurRadius: 14),
-            ],
-          ),
-        ),
+        Text('${speed.toInt()}%',
+            style: const TextStyle(color: Colors.white, fontSize: 22)),
       ],
     );
   }
 
-  Widget presetsOverlay() {
-    final controller =
-        FixedExtentScrollController(initialItem: selectedPresetIndex);
-
-    return Column(
-      children: [
-        Expanded(
-          child: CupertinoPicker(
-            scrollController: controller,
-            itemExtent: 40,
-            magnification: 1.15,
-            useMagnifier: true,
-            onSelectedItemChanged: (index) {
-              setState(() => selectedPresetIndex = index);
-              _applyPreset(presets[index]);
-            },
-            children: presets.isEmpty
-                ? [
-                    const Center(
-                        child: Text(
-                      'No presets',
-                      style: TextStyle(color: Colors.white60),
-                    ))
-                  ]
-                : presets.map((p) {
-                    final isSelected =
-                        presets.indexOf(p) == selectedPresetIndex;
-                    return Center(
-                      child: Text(
-                        p['name'] ?? 'Preset',
-                        style: TextStyle(
-                          fontSize: isSelected ? 22 : 18,
-                          fontWeight: FontWeight.bold,
-                          color: Colors.white,
-                          shadows: isSelected
-                              ? [
-                                  const Shadow(
-                                      color: Colors.redAccent, blurRadius: 18)
-                                ]
-                              : [],
-                        ),
-                      ),
-                    );
-                  }).toList(),
-          ),
-        ),
-        const SizedBox(height: 12),
-        ElevatedButton.icon(
-          style: ElevatedButton.styleFrom(
-            backgroundColor: Colors.redAccent,
-            minimumSize: const Size.fromHeight(40),
-          ),
-          icon: const Icon(Icons.save),
-          label: const Text('Save Current'),
-          onPressed: _promptSavePreset,
-        ),
-        const SizedBox(height: 8),
-        ElevatedButton.icon(
-          style: ElevatedButton.styleFrom(
-            backgroundColor: Colors.redAccent.shade700,
-            minimumSize: const Size.fromHeight(40),
-          ),
-          icon: const Icon(Icons.delete),
-          label: const Text('Delete Selected'),
-          onPressed: _deletePresetWithConfirmation,
-        ),
-      ],
-    );
-  }
-
+  // =========================
+  // COMPONENTS
+  // =========================
   Widget controlButton({
     required IconData icon,
     required String label,
     required String value,
     required VoidCallback onTap,
   }) {
-    return Material(
-      color: Colors.transparent,
-      child: InkWell(
-        borderRadius: BorderRadius.circular(18),
-        onTap: onTap,
-        child: Container(
-          height: 96,
-          decoration: BoxDecoration(
-            color: const Color(0xFF2B2B2B),
-            borderRadius: BorderRadius.circular(18),
-            border: Border.all(color: Colors.white12),
-            boxShadow: [
-              BoxShadow(
-                color: Colors.redAccent.withOpacity(0.45),
-                blurRadius: 20,
-              ),
-            ],
-          ),
-          child: Column(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              Icon(icon, size: 34, color: Colors.white),
-              const SizedBox(height: 6),
-              Text(label,
-                  style: const TextStyle(
-                      color: Colors.white, fontWeight: FontWeight.w600)),
-              Text(value,
-                  style: const TextStyle(color: Colors.white54, fontSize: 12)),
-            ],
-          ),
+    return InkWell(
+      borderRadius: BorderRadius.circular(18),
+      onTap: onTap,
+      child: Container(
+        height: 96,
+        decoration: BoxDecoration(
+          color: const Color(0xFF2B2B2B),
+          borderRadius: BorderRadius.circular(18),
+          border: Border.all(color: Colors.white12),
+        ),
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Icon(icon, size: 34, color: Colors.white),
+            const SizedBox(height: 6),
+            Text(label, style: const TextStyle(color: Colors.white)),
+            Text(value,
+                style: const TextStyle(color: Colors.white54, fontSize: 12)),
+          ],
         ),
       ),
     );
   }
 
   Widget zoneIndicator(String label, LightZone zone) {
-    final bool isSelected = selectedZones.contains(zone);
-
+    final active = selectedZones.contains(zone);
     return GestureDetector(
-      behavior: HitTestBehavior.translucent,
       onTap: () => _toggleZone(zone),
-      child: Padding(
-        padding: const EdgeInsets.all(18),
-        child: Column(
-          children: [
-            AnimatedContainer(
-              duration: const Duration(milliseconds: 200),
-              width: isSelected ? 22 : 16,
-              height: isSelected ? 22 : 16,
-              decoration: BoxDecoration(
-                shape: BoxShape.circle,
-                color: isSelected ? Colors.redAccent : Colors.white38,
-                boxShadow: isSelected
-                    ? [
-                        BoxShadow(
-                          color: Colors.redAccent.withOpacity(0.7),
-                          blurRadius: 10,
-                        )
-                      ]
-                    : [],
-              ),
+      child: Column(
+        children: [
+          Container(
+            width: active ? 22 : 16,
+            height: active ? 22 : 16,
+            decoration: BoxDecoration(
+              shape: BoxShape.circle,
+              color: active ? Colors.redAccent : Colors.white38,
             ),
-            const SizedBox(height: 4),
-            Text(
-              label,
+          ),
+          const SizedBox(height: 4),
+          Text(label,
               style: TextStyle(
                 fontSize: 10,
-                color: isSelected ? Colors.redAccent : Colors.white54,
-                fontWeight: isSelected ? FontWeight.bold : FontWeight.normal,
-              ),
-            ),
-          ],
-        ),
+                color: active ? Colors.redAccent : Colors.white54,
+              )),
+        ],
       ),
     );
   }
