@@ -33,7 +33,7 @@ class _ControlPageState extends State<ControlPage>
 
   ActiveOverlay activeOverlay = ActiveOverlay.none;
 
-  final List<String> modes = ['Solid', 'Strobe', 'Chase', 'Random'];
+  final List<String> modes = ['Solid', 'Strobe', 'Chase', 'Loop', 'Alternate', 'Random'];
 
   List<Map<String, dynamic>> presets = [];
   static const String _presetsKey = 'auramaxx_presets_v1';
@@ -65,6 +65,34 @@ class _ControlPageState extends State<ControlPage>
     widget.ble.connectionStream.listen((state) {
       if (!mounted) return;
       setState(() => isConnected = state);
+    });
+
+    widget.ble.notificationStream.listen((payload) {
+      if (!mounted) return;
+      try {
+        if (payload.isEmpty) return;
+        final map = jsonDecode(payload) as Map<String, dynamic>;
+
+        final zones = <String>[];
+        if (map.containsKey('zones')) {
+          final z = map['zones'];
+          if (z is List) zones.addAll(z.cast<String>());
+        }
+
+        selectedZones.clear();
+        for (final s in zones) {
+          if (s == 'front_left') selectedZones.add(LightZone.frontLeft);
+          if (s == 'front_right') selectedZones.add(LightZone.frontRight);
+          if (s == 'rear_left') selectedZones.add(LightZone.rearLeft);
+          if (s == 'rear_right') selectedZones.add(LightZone.rearRight);
+        }
+
+        if (map.containsKey('mode')) {
+          selectedMode = map['mode'] as String? ?? selectedMode;
+        }
+
+        setState(() {});
+      } catch (_) {}
     });
 
     _loadPresets();

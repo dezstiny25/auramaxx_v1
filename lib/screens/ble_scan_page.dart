@@ -59,19 +59,7 @@ class _BleScanPageState extends State<BleScanPage> {
     try {
       await widget.ble.disconnect();
       await device.connect(autoConnect: false);
-
-      widget.ble.connectedDevice = device;
-      widget.ble.controlCharacteristic = null;
-
-      final services = await device.discoverServices();
-      for (final service in services) {
-        for (final c in service.characteristics) {
-          if (c.uuid == BleController.characteristicUuid) {
-            widget.ble.controlCharacteristic = c;
-          }
-        }
-      }
-
+      await widget.ble.setupDevice(device);
       widget.ble.notifyConnected(true);
       Navigator.pop(context);
 

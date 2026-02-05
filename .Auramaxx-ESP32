@@ -1,3 +1,5 @@
+//Auramaxx-ESP32.ino
+
 #include <BLEDevice.h>
 #include <BLEServer.h>
 #include <BLEUtils.h>
@@ -30,6 +32,9 @@ bool zoneRR = false;
 unsigned long lastTick = 0;
 bool pulseOn = false;
 int chaseIndex = 0;
+int loopDir = 1; // 1 = forward, -1 = backward for Loop mode
+bool loopRepeat = false; // used to duplicate endpoints in Loop mode
+bool altState = false; // toggles between groups for Alternate mode
 
 // ================== HELPERS ==================
 void relayWrite(int pin, bool on) {
@@ -133,37 +138,94 @@ void loop() {
 
   if (currentMode == "Solid") {
     applyZones(true);
+    pulseOn = false;
+    lastTick = now;
     return;
   }
 
-  if (now - lastTick < offDelayMs) return;
-  lastTick = now;
-
-  // Short ON pulse
-  if (currentMode == "Strobe") {
-    applyZones(true);
-    delay(50);
+  if (currentMode == "Off") {
     allOff();
+    pulseOn = false;
+    return;
   }
 
-  else if (currentMode == "Chase") {
-    allOff();
-    if (chaseIndex == 0 && zoneFL) relayWrite(FL_PIN, true);
-    if (chaseIndex == 1 && zoneFR) relayWrite(FR_PIN, true);
-    if (chaseIndex == 2 && zoneRL) relayWrite(RL_PIN, true);
-    if (chaseIndex == 3 && zoneRR) relayWrite(RR_PIN, true);
-    delay(50);
-    allOff();
-    chaseIndex = (chaseIndex + 1) % 4;
+  // If not currently in a short ON pulse, check if it's time to start one
+  if (!pulseOn) {
+    if (now - lastTick >= (unsigned long)offDelayMs) {
+      pulseOn = true;
+      lastTick = now;
+
+      if (currentMode == "Strobe") {
+        applyZones(true);
+      } else if (currentMode == "Chase") {
+        allOff();
+        if (chaseIndex == 0 && zoneFL) relayWrite(FL_PIN, true);
+        if (chaseIndex == 1 && zoneFR) relayWrite(FR_PIN, true);
+        if (chaseIndex == 2 && zoneRL) relayWrite(RL_PIN, true);
+        if (chaseIndex == 3 && zoneRR) relayWrite(RR_PIN, true);
+      } else if (currentMode == "Loop") {
+        // bounce back pattern with duplicated endpoints
+        allOff();
+        if (chaseIndex == 0 && zoneFL) relayWrite(FL_PIN, true);
+        if (chaseIndex == 1 && zoneFR) relayWrite(FR_PIN, true);
+        if (chaseIndex == 2 && zoneRL) relayWrite(RL_PIN, true);
+        if (chaseIndex == 3 && zoneRR) relayWrite(RR_PIN, true);
+      } else if (currentMode == "Alternate") {
+        // Toggle between front (FL/FR) and rear (RL/RR) groups
+        altState = !altState;
+        if (altState) {
+          if (zoneFL) relayWrite(FL_PIN, true);
+          if (zoneFR) relayWrite(FR_PIN, true);
+        } else {
+          if (zoneRL) relayWrite(RL_PIN, true);
+          if (zoneRR) relayWrite(RR_PIN, true);
+        }
+      } else if (currentMode == "Random") {
+        allOff();
+        if (random(0, 2)) relayWrite(FL_PIN, true);
+        if (random(0, 2)) relayWrite(FR_PIN, true);
+        if (random(0, 2)) relayWrite(RL_PIN, true);
+        if (random(0, 2)) relayWrite(RR_PIN, true);
+      }
+    }
   }
 
-  else if (currentMode == "Random") {
-    allOff();
-    if (random(0, 2)) relayWrite(FL_PIN, true);
-    if (random(0, 2)) relayWrite(FR_PIN, true);
-    if (random(0, 2)) relayWrite(RL_PIN, true);
-    if (random(0, 2)) relayWrite(RR_PIN, true);
-    delay(50);
-    allOff();
+  // If in a pulse, wait for the short pulse duration then turn off and advance state
+  else {
+    if (now - lastTick >= 50) {
+      allOff();
+      pulseOn = false;
+      lastTick = now;
+      if (currentMode == "Chase") {
+        chaseIndex = (chaseIndex + 1) % 4;
+      } else if (currentMode == "Loop") {
+        // advance with bounce and duplicate endpoints
+        if (loopDir == 1) {
+          if (chaseIndex < 3) {
+            chaseIndex++;
+          } else {
+            if (!loopRepeat) {
+              loopRepeat = true; // repeat the endpoint once
+            } else {
+              loopDir = -1;
+              loopRepeat = false;
+              chaseIndex = 2;
+            }
+          }
+        } else { // backward
+          if (chaseIndex > 0) {
+            chaseIndex--;
+          } else {
+            if (!loopRepeat) {
+              loopRepeat = true;
+            } else {
+              loopDir = 1;
+              loopRepeat = false;
+              chaseIndex = 1;
+            }
+          }
+        }
+      }
+    }
   }
 }
