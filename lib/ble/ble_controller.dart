@@ -17,11 +17,12 @@ class BleController {
   static final Guid serviceUuid = Guid("6E400001-B5A3-F393-E0A9-E50E24DCCA9E");
   static final Guid characteristicUuid =
       Guid("6E400002-B5A3-F393-E0A9-E50E24DCCA9E");
-    static final Guid notifyUuid =
-      Guid("6E400003-B5A3-F393-E0A9-E50E24DCCA9E");
+  static final Guid notifyUuid = Guid("6E400003-B5A3-F393-E0A9-E50E24DCCA9E");
 
   StreamSubscription<List<ScanResult>>? _scanSub;
   StreamSubscription<List<int>>? _notifySub;
+  StreamSubscription<BluetoothConnectionState>? _deviceConnectionSub;
+  Timer? _healthTimer;
 
   final StreamController<String> _notifyController =
       StreamController<String>.broadcast();
@@ -48,14 +49,17 @@ class BleController {
 
           _connectionController.add(true);
 
-          // Listen for disconnect
-          r.device.connectionState.listen((state) {
+          // Listen for device connection state changes
+          _deviceConnectionSub?.cancel();
+          _deviceConnectionSub = r.device.connectionState.listen((state) {
             if (state == BluetoothConnectionState.disconnected) {
-              _connectionController.add(false);
-              connectedDevice = null;
-              controlCharacteristic = null;
+              _handleDisconnect();
             }
           });
+
+          // Start periodic health check to catch resets that the OS
+          // doesn't immediately surface as a disconnect.
+          _startHealthCheck();
 
           return;
         }
@@ -72,13 +76,11 @@ class BleController {
           await _notifySub?.cancel();
         }
       } catch (_) {}
+      try {
+        await connectedDevice!.disconnect();
+      } catch (_) {}
 
-      await connectedDevice!.disconnect();
-      connectedDevice = null;
-      controlCharacteristic = null;
-      notifyCharacteristic = null;
-      _notifyController.add('');
-      _connectionController.add(false);
+      _handleDisconnect();
     }
   }
 
@@ -129,5 +131,39 @@ class BleController {
   // Public wrapper
   Future<void> setupDevice(BluetoothDevice device) async {
     return _setupDevice(device);
+  }
+
+  void _startHealthCheck() {
+    _healthTimer?.cancel();
+    _healthTimer = Timer.periodic(const Duration(seconds: 2), (_) async {
+      try {
+        if (connectedDevice == null) return;
+        final conns = await FlutterBluePlus.connectedDevices;
+        final stillConnected = conns.any((d) =>
+            d.remoteId.toString() == connectedDevice!.remoteId.toString());
+        if (!stillConnected) {
+          _handleDisconnect();
+        }
+      } catch (_) {}
+    });
+  }
+
+  void _handleDisconnect() {
+    _deviceConnectionSub?.cancel();
+    _deviceConnectionSub = null;
+
+    _healthTimer?.cancel();
+    _healthTimer = null;
+
+    try {
+      _notifySub?.cancel();
+    } catch (_) {}
+    _notifySub = null;
+
+    connectedDevice = null;
+    controlCharacteristic = null;
+    notifyCharacteristic = null;
+    _notifyController.add('');
+    _connectionController.add(false);
   }
 }

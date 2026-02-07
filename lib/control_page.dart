@@ -33,7 +33,14 @@ class _ControlPageState extends State<ControlPage>
 
   ActiveOverlay activeOverlay = ActiveOverlay.none;
 
-  final List<String> modes = ['Solid', 'Strobe', 'Chase', 'Loop', 'Alternate', 'Random'];
+  final List<String> modes = [
+    'Solid',
+    'Strobe',
+    'Chase',
+    'Loop',
+    'Alternate',
+    'Random'
+  ];
 
   List<Map<String, dynamic>> presets = [];
   static const String _presetsKey = 'auramaxx_presets_v1';
